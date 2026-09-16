@@ -106,11 +106,13 @@ const (
 	// udpRaceTimeout is the timeout after which we will start a DNS query
 	// over TCP while waiting for the UDP query to complete.
 	udpRaceTimeout = 2 * time.Second
-
-	// tcpQueryTimeout is the timeout for a DNS query performed over TCP.
-	// It matches the default 5sec timeout of the 'dig' utility.
-	tcpQueryTimeout = 5 * time.Second
 )
+
+// tcpQueryTimeout is the timeout for a DNS query performed over TCP.
+// It matches the default 5sec timeout of the 'dig' utility.
+//
+// It's a var only so tests can shorten it.
+var tcpQueryTimeout = 5 * time.Second
 
 // txid identifies a DNS transaction.
 //
@@ -747,6 +749,12 @@ func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr resolverAndDe
 	firstUDP := func(ctx context.Context) ([]byte, error) {
 		resp, err := f.sendUDP(ctx, fq, rr)
 		if err != nil {
+			if rcodeErr, ok := errors.AsType[rcodeResponseError](err); ok {
+				// An upstream REFUSED or SERVFAIL is a complete answer.
+				// Return it as the race's result so the race doesn't wait
+				// on a TCP retry. send converts it back to an error.
+				return rcodeErr.res, nil
+			}
 			return nil, err
 		}
 		if !truncatedFlagSet(resp) {
@@ -777,12 +785,9 @@ func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr resolverAndDe
 		return nil, truncatedResponseError{resp}
 	}
 	thenTCP := func(ctx context.Context) ([]byte, error) {
-		// If we're skipping the TCP fallback, then wait until the
-		// context is canceled and return that error (i.e. not
-		// returning anything).
+		// Report the disabled retry instead of waiting out the context.
 		if skipTCP {
-			<-ctx.Done()
-			return nil, ctx.Err()
+			return nil, errTCPRetryDisabled
 		}
 
 		return f.sendTCP(ctx, fq, rr)
@@ -799,6 +804,12 @@ func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr resolverAndDe
 	rh := race.New(timeout, firstUDP, thenTCP)
 	resp, err := rh.Start(ctx)
 	if err == nil {
+		// firstUDP returns an upstream REFUSED or SERVFAIL as a result.
+		// Convert it back to the soft error callers expect.
+		switch rcode := getRCode(resp); rcode {
+		case dns.RCodeServerFailure, dns.RCodeRefused:
+			return nil, rcodeResponseError{rcode, resp}
+		}
 		return resp, nil
 	}
 
@@ -838,6 +849,11 @@ func (r rcodeResponseError) Unwrap() error {
 var errRefused = errors.New("response code indicates refusal")
 var errServerFailure = errors.New("response code indicates server issue")
 var errTxIDMismatch = errors.New("txid doesn't match")
+
+// errTCPRetryDisabled is what the TCP arm of the race in send reports when TCP
+// retries are disabled, so that a failed UDP query returns at once instead of
+// waiting out its deadline.
+var errTCPRetryDisabled = errors.New("no TCP retry: disabled by envknob or control knob")
 
 func (f *forwarder) sendUDP(ctx context.Context, fq *forwardQuery, rr resolverAndDelay) (ret []byte, err error) {
 	ipp, ok := rr.name.IPPort()
@@ -1065,6 +1081,16 @@ func (f *forwarder) sendTCP(ctx context.Context, fq *forwardQuery, rr resolverAn
 		return nil, err
 	}
 	defer conn.Close()
+
+	// Canceling ctx can't interrupt reads blocked in the runtime, so the
+	// deadline has to go on the conn. ctx already carries
+	// min(caller's deadline, tcpQueryTimeout).
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			// Best effort. The caller's ctx still bounds the read.
+			f.logf("sendTCP: setting conn deadline: %v", err)
+		}
+	}
 
 	fq.closeOnCtxDone.Add(conn)
 	defer fq.closeOnCtxDone.Remove(conn)
