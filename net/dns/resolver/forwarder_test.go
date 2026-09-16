@@ -347,6 +347,10 @@ type testDNSServerOptions struct {
 	// HangTCP accepts TCP connections and never answers them. With SkipTCP
 	// nothing listens, so the connect fails fast instead.
 	HangTCP bool
+
+	// ResponseDelay is how long the server waits before answering, on either
+	// transport.
+	ResponseDelay time.Duration
 }
 
 func runDNSServer(tb testing.TB, opts *testDNSServerOptions, response []byte, onRequest func(bool, []byte)) (port uint16) {
@@ -421,6 +425,10 @@ func runDNSServer(tb testing.TB, opts *testDNSServerOptions, response []byte, on
 		req = req[:n]
 		onRequest(true, req)
 
+		if opts != nil && opts.ResponseDelay > 0 {
+			time.Sleep(opts.ResponseDelay)
+		}
+
 		// Write response
 		if _, err := conn.Write(tcpResponse); err != nil {
 			logf("error writing response: %v", err)
@@ -462,6 +470,9 @@ func runDNSServer(tb testing.TB, opts *testDNSServerOptions, response []byte, on
 
 	handleUDP := func(addr netip.AddrPort, req []byte) {
 		onRequest(false, req)
+		if opts != nil && opts.ResponseDelay > 0 {
+			time.Sleep(opts.ResponseDelay)
+		}
 		if _, err := udpLn.WriteToUDPAddrPort(response, addr); err != nil {
 			logf("error writing response: %v", err)
 		}
@@ -1416,6 +1427,114 @@ func TestForwarderTCPRetriesDisabledDoesNotStall(t *testing.T) {
 	}
 	if ctx.Err() != nil {
 		t.Error("send waited out the caller's context instead of reporting the disabled retry")
+	}
+}
+
+// TestForwarderRcodeHoldWithOutstandingResolver checks that an upstream REFUSED
+// reaches the client even though another resolver in the race never reports.
+func TestForwarderRcodeHoldWithOutstandingResolver(t *testing.T) {
+	const domain = "refused-with-hung-peer.tailscale.com."
+	request := makeTestRequest(t, domain, dns.TypeA, 0)
+	response := makeTestResponse(t, domain, dns.RCodeRefused)
+
+	// Shortened to keep the test fast.
+	tstest.Replace(t, &rcodeHoldGrace, 300*time.Millisecond)
+
+	refusingPort := runDNSServer(t, nil, response, func(isTCP bool, gotRequest []byte) {})
+	// Bound on both transports but answering on neither, so queries to it hang
+	// rather than failing fast.
+	hungPort := runDNSServer(t, &testDNSServerOptions{SkipUDP: true, HangTCP: true},
+		response, func(isTCP bool, gotRequest []byte) {})
+
+	// Bumped only when a forward runs out its context.
+	beforeCtx := metricDNSFwdErrorContext.Value()
+	resp, err := runTestQuery(t, request, beVerbose, refusingPort, hungPort)
+	if err != nil {
+		t.Fatalf("runTestQuery: %v", err)
+	}
+	if !bytes.Equal(resp, response) {
+		t.Errorf("invalid response\ngot: %+v\nwant: %+v", resp, response)
+	}
+	if got := metricDNSFwdErrorContext.Value() - beforeCtx; got != 0 {
+		t.Errorf("dns_query_fwd_error_context advanced by %d; the held REFUSED was not released before the context ended", got)
+	}
+}
+
+func TestRcodeHoldDelay(t *testing.T) {
+	res := func(delays ...time.Duration) []resolverAndDelay {
+		rr := make([]resolverAndDelay, len(delays))
+		for i, d := range delays {
+			rr[i] = resolverAndDelay{name: &dnstype.Resolver{Addr: "8.8.8.8:53"}, startDelay: d}
+		}
+		return rr
+	}
+	tests := []struct {
+		name      string
+		resolvers []resolverAndDelay
+		elapsed   time.Duration
+		want      time.Duration
+	}{
+		{"no delays", res(0, 0), 0, rcodeHoldGrace},
+		{"no delays, late rcode", res(0, 0), 50 * time.Millisecond, rcodeHoldGrace - 50*time.Millisecond},
+		{"waits out the largest delay", res(0, dohHeadStart), 0, dohHeadStart + rcodeHoldGrace},
+		{"delay already elapsed", res(0, dohHeadStart), dohHeadStart, rcodeHoldGrace},
+		{"grace already elapsed", res(0, dohHeadStart), dohHeadStart + rcodeHoldGrace + time.Second, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := rcodeHoldDelay(tt.resolvers, tt.elapsed); got != tt.want {
+				t.Errorf("rcodeHoldDelay = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestForwarderRcodeHoldWaitsForDelayedResolver checks that a fast REFUSED
+// doesn't cut off a resolver still inside its startDelay.
+func TestForwarderRcodeHoldWaitsForDelayedResolver(t *testing.T) {
+	const domain = "refused-then-delayed.tailscale.com."
+	request := makeTestRequest(t, domain, dns.TypeA, 0)
+	refused := makeTestResponse(t, domain, dns.RCodeRefused)
+	answer := makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.1"))
+
+	refusingPort := runDNSServer(t, nil, refused, func(isTCP bool, gotRequest []byte) {})
+	answeringPort := runDNSServer(t, nil, answer, func(isTCP bool, gotRequest []byte) {})
+
+	resolvers := []resolverAndDelay{
+		{name: &dnstype.Resolver{Addr: fmt.Sprintf("127.0.0.1:%d", refusingPort)}},
+		{name: &dnstype.Resolver{Addr: fmt.Sprintf("127.0.0.1:%d", answeringPort)}, startDelay: dohHeadStart},
+	}
+
+	resp, err := runTestQueryWithResolvers(t, request, "udp", beVerbose, resolvers...)
+	if err != nil {
+		t.Fatalf("runTestQueryWithResolvers: %v", err)
+	}
+	// The answer can only exist if the hold outlasted the startDelay, so the
+	// bytes are the whole check.
+	if !bytes.Equal(resp, answer) {
+		t.Errorf("invalid response\ngot:  %+v\nwant: %+v", resp, answer)
+	}
+}
+
+// TestForwarderRcodeHoldWaitsForSlowResolver checks that a fast SERVFAIL from
+// one resolver doesn't beat a slower answer from another.
+func TestForwarderRcodeHoldWaitsForSlowResolver(t *testing.T) {
+	const domain = "servfail-then-slow-answer.tailscale.com."
+	request := makeTestRequest(t, domain, dns.TypeA, 0)
+	servfail := makeTestResponse(t, domain, dns.RCodeServerFailure)
+	answer := makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.1"))
+
+	failingPort := runDNSServer(t, nil, servfail, func(isTCP bool, gotRequest []byte) {})
+	// 350ms is an ordinary cross-region latency, well inside rcodeHoldGrace.
+	slowPort := runDNSServer(t, &testDNSServerOptions{ResponseDelay: 350 * time.Millisecond},
+		answer, func(isTCP bool, gotRequest []byte) {})
+
+	resp, err := runTestQuery(t, request, beVerbose, failingPort, slowPort)
+	if err != nil {
+		t.Fatalf("runTestQuery: %v", err)
+	}
+	if !bytes.Equal(resp, answer) {
+		t.Errorf("invalid response\ngot:  %+v\nwant: %+v", resp, answer)
 	}
 }
 
