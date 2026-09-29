@@ -98,6 +98,12 @@ var (
 	tcpUserTimeout = flag.Duration("tcp-user-timeout", 15*time.Second, "TCP user timeout")
 	// tcpWriteTimeout is the timeout for writing to client TCP connections. It does not apply to mesh connections.
 	tcpWriteTimeout = flag.Duration("tcp-write-timeout", derpserver.DefaultTCPWiteTimeout, "TCP write timeout; 0 results in no timeout being set on writes")
+	// tcpSaveSyn enables TCP_SAVE_SYN on the listen socket (Linux only), so
+	// that the kernel retains a copy of each client's SYN packet on the
+	// accepted connections. The DERP server then reads each SYN with
+	// TCP_SAVED_SYN to recover the client's advertised MSS and publish it
+	// as a metric (see derpserver.SetTCPSaveSyn).
+	tcpSaveSyn = flag.Bool("tcp-save-syn", false, "whether to enable TCP_SAVE_SYN on the listen socket (Linux only), recovering each client's advertised TCP MSS from its saved SYN packet for metrics")
 
 	// ACE
 	flagACEEnabled = flag.Bool("ace", false, "whether to enable embedded ACE server [experimental + in-development as of 2025-09-12; not yet documented]")
@@ -200,6 +206,14 @@ func main() {
 		s.SetDisallowedAppNames(strings.Split(*disallowAppNames, ","))
 	}
 	s.SetTCPWriteTimeout(*tcpWriteTimeout)
+	if *tcpSaveSyn {
+		if runtime.GOOS == "linux" {
+			s.SetTCPSaveSyn(true)
+			log.Printf("derper: TCP_SAVE_SYN enabled; recovering client MSS from saved SYN packets")
+		} else {
+			log.Printf("derper: --tcp-save-syn is only supported on Linux; ignoring")
+		}
+	}
 	if *rateConfigPath != "" {
 		if err := s.LoadAndApplyRateConfig(*rateConfigPath); err != nil {
 			log.Fatalf("derper: loading rate config: %v", err)
@@ -325,7 +339,7 @@ func main() {
 	// keepalive counter, so the probe if unanswered will take effect promptly,
 	// this is less tolerant of high loss, but high loss is unexpected.
 	lc := net.ListenConfig{
-		Control:   ktimeout.UserTimeout(*tcpUserTimeout),
+		Control:   listenControlFunc(),
 		KeepAlive: *tcpKeepAlive,
 	}
 	// As of 2025-02-19, MPTCP does not support TCP_USER_TIMEOUT socket option
@@ -444,6 +458,19 @@ func main() {
 	}
 	if err != nil && err != http.ErrServerClosed {
 		log.Fatalf("derper: %v", err)
+	}
+}
+
+// listenControlFunc returns the net.ListenConfig.Control function used by
+// derper's listeners: it composes ktimeout's TCP_USER_TIMEOUT with the
+// TCP_SAVE_SYN option from --tcp-save-syn (a no-op on non-Linux platforms).
+func listenControlFunc() func(network, address string, c syscall.RawConn) error {
+	userTimeoutControl := ktimeout.UserTimeout(*tcpUserTimeout)
+	return func(network, address string, c syscall.RawConn) error {
+		if err := userTimeoutControl(network, address, c); err != nil {
+			return err
+		}
+		return controlTCPSaveSyn(network, c)
 	}
 }
 
