@@ -1424,19 +1424,18 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 		}(&resolvers[i])
 	}
 
-	var firstErr error
+	// heldErr is the error deliverHeldResponse answers from, and the error
+	// returned when no response can be sent. A REFUSED never displaces another
+	// error and any other error displaces a REFUSED, so heldErr is a REFUSED
+	// only when every resolver refused.
+	var heldErr error
 	var numErr int
-	var sawNonRefused bool
 
-	// noteErr records a resolver's error for deliverHeldResponse.
 	noteErr := func(err error) {
-		if firstErr == nil {
-			firstErr = err
-		}
-		if !errors.Is(err, errRefused) {
-			sawNonRefused = true
-		}
 		numErr++
+		if heldErr == nil || (errors.Is(heldErr, errRefused) && !errors.Is(err, errRefused)) {
+			heldErr = err
+		}
 	}
 
 	// deliverSuccess gives the client an upstream's successful response.
@@ -1455,36 +1454,21 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 		}
 	}
 
-	// deliverHeldResponse gives the client the upstream's REFUSED when every
-	// error so far was a REFUSED, and SERVFAIL otherwise. Like
+	// deliverHeldResponse gives the client the upstream response heldErr
+	// carries, or a synthesized SERVFAIL when it carries none. Like
 	// forwardWithDestChan, it either sends to responseChan and returns nil, or
-	// returns firstErr without sending.
+	// returns heldErr without sending.
 	deliverHeldResponse := func() error {
 		var res packet
-		if sawNonRefused {
-			// Prefer the upstream's own SERVFAIL bytes. firstErr may instead
-			// be an earlier REFUSED, hence the rcode guard.
-			if rcodeErr, ok := errors.AsType[rcodeResponseError](firstErr); ok && rcodeErr.rcode == dns.RCodeServerFailure {
-				res = packet{rcodeErr.res, query.family, query.addr}
-			} else {
-				r, err := servfailResponse(query)
-				if err != nil {
-					f.logf("building servfail response: %v", err)
-					return firstErr
-				}
-				res = r
-			}
-		} else {
-			// Every error so far carried a REFUSED, so firstErr holds an
-			// upstream response. Deliver it as is.
-			rcodeErr, ok := errors.AsType[rcodeResponseError](firstErr)
-			if !ok {
-				// Unreachable: errRefused only ever arrives inside a
-				// rcodeResponseError.
-				f.logf("unexpected: all errors were REFUSED but firstErr is not rcodeResponseError: %v", firstErr)
-				return firstErr
-			}
+		if rcodeErr, ok := errors.AsType[rcodeResponseError](heldErr); ok {
 			res = packet{rcodeErr.res, query.family, query.addr}
+		} else {
+			r, err := servfailResponse(query)
+			if err != nil {
+				f.logf("building servfail response: %v", err)
+				return heldErr
+			}
+			res = r
 		}
 		select {
 		case <-ctx.Done():
@@ -1499,11 +1483,11 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 			}
 		case responseChan <- res:
 			if f.verboseFwd {
-				f.logf("forwarder response(%d, %v, %d) = %d, %v", fq.txid, typ, len(domain), len(res.bs), firstErr)
+				f.logf("forwarder response(%d, %v, %d) = %d, %v", fq.txid, typ, len(domain), len(res.bs), heldErr)
 			}
 			return nil
 		}
-		return firstErr
+		return heldErr
 	}
 
 	// holdC stays nil, and a nil channel never fires, until an rcode error
@@ -1545,9 +1529,9 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 			return deliverHeldResponse()
 		case <-ctx.Done():
 			metricDNSFwdErrorContext.Add(1)
-			if firstErr != nil {
+			if heldErr != nil {
 				metricDNSFwdErrorContextGotError.Add(1)
-				return firstErr
+				return heldErr
 			}
 
 			// If we haven't got an error or a successful response,

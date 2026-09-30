@@ -1582,6 +1582,42 @@ func TestForwarderRcodeHoldWaitsForSlowResolver(t *testing.T) {
 	}
 }
 
+// TestForwarderHeldServfailPrefersUpstreamBytes checks that an upstream
+// SERVFAIL arriving after a REFUSED reaches the client as the upstream's own
+// response rather than a synthesized one.
+func TestForwarderHeldServfailPrefersUpstreamBytes(t *testing.T) {
+	const domain = "refused-then-servfail.tailscale.com."
+	request := makeTestRequest(t, domain, dns.TypeA, 0)
+	refused := makeTestResponse(t, domain, dns.RCodeRefused)
+
+	// RecursionAvailable is never set on a synthesized SERVFAIL, so the bytes
+	// tell the two apart.
+	b := dns.NewBuilder(nil, dns.Header{
+		Response:           true,
+		Authoritative:      true,
+		RecursionAvailable: true,
+		RCode:              dns.RCodeServerFailure,
+	})
+	b.StartQuestions()
+	b.Question(dns.Question{Name: dns.MustNewName(domain), Type: dns.TypeA, Class: dns.ClassINET})
+	servfail, err := b.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	refusingPort := runDNSServer(t, nil, refused, func(isTCP bool, gotRequest []byte) {})
+	failingPort := runDNSServer(t, &testDNSServerOptions{ResponseDelay: 100 * time.Millisecond},
+		servfail, func(isTCP bool, gotRequest []byte) {})
+
+	resp, err := runTestQuery(t, request, beVerbose, refusingPort, failingPort)
+	if err != nil {
+		t.Fatalf("runTestQuery: %v", err)
+	}
+	if !bytes.Equal(resp, servfail) {
+		t.Errorf("invalid response\ngot:  %+v\nwant: %+v", resp, servfail)
+	}
+}
+
 // TestSendTCPReadTimeout checks that tcpQueryTimeout bounds the response read
 // against an upstream that accepts the connection and never answers.
 func TestSendTCPReadTimeout(t *testing.T) {
